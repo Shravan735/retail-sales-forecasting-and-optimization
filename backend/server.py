@@ -8,7 +8,7 @@ import re
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
@@ -25,9 +25,13 @@ from xgboost import XGBRegressor
 
 MAX_UPLOAD_BYTES = 35 * 1024 * 1024
 FORECAST_MONTHS = 3
+RANDOM_SEED = 42
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = PROJECT_ROOT / "backend" / "runs"
 RUNS_DIR.mkdir(parents=True, exist_ok=True)
+
+np.random.seed(RANDOM_SEED)
+keras.utils.set_random_seed(RANDOM_SEED)
 
 app = FastAPI(title="RSO Backend", version="1.0.0")
 app.add_middleware(
@@ -270,6 +274,7 @@ def clean_dataframe(raw_df: pd.DataFrame, schema: dict[str, Any]) -> tuple[pd.Da
     df = raw_df.copy()
     original_columns = list(df.columns)
     df.columns = [normalize_column_name(column) for column in df.columns]
+    target_column = schema.get("target_column")
 
     before_rows = len(df)
     duplicate_rows = int(df.duplicated().sum())
@@ -297,10 +302,16 @@ def clean_dataframe(raw_df: pd.DataFrame, schema: dict[str, Any]) -> tuple[pd.Da
     if invalid_dates_removed:
         df = df.dropna(subset=["analysis_date"]).reset_index(drop=True)
 
+    invalid_targets_removed = 0
+    if target_column and target_column in df.columns:
+        invalid_targets_removed = int(df[target_column].isna().sum())
+        if invalid_targets_removed:
+            df = df.dropna(subset=[target_column]).reset_index(drop=True)
+
     if df.empty:
         raise HTTPException(
             status_code=400,
-            detail="The uploaded file did not contain enough valid date values to build a forecasting timeline.",
+            detail="The uploaded file did not contain enough valid date and target values to build a forecasting timeline.",
         )
 
     missing_before = df.isna().sum()
@@ -309,6 +320,8 @@ def clean_dataframe(raw_df: pd.DataFrame, schema: dict[str, Any]) -> tuple[pd.Da
 
     for column in df.columns:
         if column == "analysis_date":
+            continue
+        if column == target_column:
             continue
         if df[column].dtype.kind in {"i", "u", "f"}:
             if df[column].isna().any():
@@ -329,6 +342,7 @@ def clean_dataframe(raw_df: pd.DataFrame, schema: dict[str, Any]) -> tuple[pd.Da
         "rows_after_cleaning": int(len(df)),
         "duplicates_removed": duplicate_rows,
         "invalid_dates_removed": invalid_dates_removed,
+        "target_values_removed": invalid_targets_removed,
         "trimmed_text_columns": trimmed_columns,
         "missing_values_before": {column: int(value) for column, value in missing_before.items() if int(value) > 0},
         "missing_values_after": {column: int(value) for column, value in missing_after.items() if int(value) > 0},
@@ -337,6 +351,7 @@ def clean_dataframe(raw_df: pd.DataFrame, schema: dict[str, Any]) -> tuple[pd.Da
         "cleaning_applied": bool(
             duplicate_rows
             or invalid_dates_removed
+            or invalid_targets_removed
             or filled_numeric
             or filled_categorical
             or trimmed_columns
@@ -354,10 +369,14 @@ def build_monthly_series(df: pd.DataFrame, schema: dict[str, Any]) -> tuple[pd.D
 
     target_column = schema["target_column"]
     working = df.copy()
-    working[target_column] = pd.to_numeric(working[target_column], errors="coerce").fillna(0.0)
+    working[target_column] = pd.to_numeric(working[target_column], errors="coerce")
+    working = working.dropna(subset=[target_column])
+    if working.empty:
+        raise HTTPException(status_code=400, detail="The target sales column did not contain usable numeric values.")
+
+    working["month_bucket"] = working["analysis_date"].dt.to_period("M").dt.to_timestamp()
     monthly = (
-        working.assign(month_bucket=working["analysis_date"].dt.to_period("M").dt.to_timestamp())
-        .groupby("month_bucket", as_index=False)[target_column]
+        working.groupby("month_bucket", as_index=False)[target_column]
         .sum()
         .rename(columns={"month_bucket": "date", target_column: "target"})
         .sort_values("date")
@@ -369,19 +388,54 @@ def build_monthly_series(df: pd.DataFrame, schema: dict[str, Any]) -> tuple[pd.D
             detail="The uploaded file did not produce a usable monthly timeline for forecasting.",
         )
 
+    partial_last_period_removed = False
+    partial_last_period = None
+    latest_period_days_observed = None
+    typical_period_days_observed = None
+    if schema.get("date_column"):
+        day_counts = (
+            working.assign(observed_day=working["analysis_date"].dt.normalize())
+            .groupby("month_bucket")["observed_day"]
+            .nunique()
+            .sort_index()
+        )
+        if len(day_counts) >= 3:
+            latest_month = day_counts.index[-1]
+            previous_counts = day_counts.iloc[:-1]
+            latest_rows = working[working["month_bucket"] == latest_month]
+            latest_last_day_seen = int(latest_rows["analysis_date"].dt.day.max())
+            days_in_latest_month = int(latest_month.days_in_month)
+            latest_period_days_observed = int(day_counts.iloc[-1])
+            typical_period_days_observed = round(float(previous_counts.median()), 2)
+
+            is_calendar_incomplete = latest_last_day_seen < days_in_latest_month
+            is_materially_sparse = latest_period_days_observed < max(3.0, typical_period_days_observed * 0.6)
+            if is_calendar_incomplete and is_materially_sparse:
+                partial_last_period_removed = True
+                partial_last_period = latest_month.strftime("%Y-%m")
+                monthly = monthly[monthly["date"] != latest_month].reset_index(drop=True)
+
     observed_months = int(len(monthly))
     full_range = pd.date_range(monthly["date"].min(), monthly["date"].max(), freq="MS")
     monthly = monthly.set_index("date").reindex(full_range).rename_axis("date").reset_index()
     missing_months = int(monthly["target"].isna().sum())
-    monthly["target"] = monthly["target"].fillna(0.0)
+    if missing_months:
+        monthly["target"] = monthly["target"].interpolate(method="linear", limit_direction="both")
+        monthly["target"] = monthly["target"].fillna(0.0)
 
     monthly_meta = {
         "missing_months_filled": missing_months,
-        "partial_last_period_removed": False,
+        "missing_months_method": "linear interpolation" if missing_months else "not needed",
+        "partial_last_period_removed": partial_last_period_removed,
+        "partial_last_period": partial_last_period,
         "series_length": int(len(monthly)),
         "observed_months": observed_months,
-        "gap_handling": "missing months without records were treated as zero observed sales" if missing_months else "no monthly gaps were found",
+        "latest_period_days_observed": latest_period_days_observed,
+        "typical_period_days_observed": typical_period_days_observed,
+        "gap_handling": "missing months were linearly interpolated for model continuity" if missing_months else "no monthly gaps were found",
     }
+    if partial_last_period_removed:
+        monthly_meta["gap_handling"] += f"; incomplete latest period {partial_last_period} was excluded from model training"
     return monthly, target_column, monthly_meta
 
 
@@ -394,9 +448,9 @@ def create_feature_frame(monthly: pd.DataFrame) -> pd.DataFrame:
     frame["month_cos"] = np.cos(2 * np.pi * frame["month"] / 12)
 
     lags = [1, 2, 3]
-    if len(frame) >= 9:
+    if len(frame) >= 12:
         lags.append(6)
-    if len(frame) >= 18:
+    if len(frame) >= 24:
         lags.append(12)
 
     for lag in sorted(set(lags)):
@@ -404,7 +458,7 @@ def create_feature_frame(monthly: pd.DataFrame) -> pd.DataFrame:
 
     frame["rolling_mean_3"] = frame["target"].shift(1).rolling(3).mean()
     frame["rolling_std_3"] = frame["target"].shift(1).rolling(3).std()
-    if len(frame) >= 9:
+    if len(frame) >= 12:
         frame["rolling_mean_6"] = frame["target"].shift(1).rolling(6).mean()
     frame["pct_change_1"] = frame["target"].pct_change().replace([np.inf, -np.inf], np.nan)
     frame["pct_change_3"] = frame["target"].pct_change(3).replace([np.inf, -np.inf], np.nan)
@@ -434,40 +488,51 @@ def compute_metrics(actual: np.ndarray, predicted: np.ndarray) -> dict[str, floa
     return sanitize_for_json({"mae": mae, "rmse": rmse, "mape": mape, "r2": r2})
 
 
-def recursive_forecast(model: Any, history: list[float], future_dates: pd.DatetimeIndex, feature_columns: list[str]) -> list[dict[str, Any]]:
+def build_recursive_feature_row(values: list[float], forecast_date: pd.Timestamp, time_index: int, feature_columns: list[str]) -> pd.DataFrame:
+    recent_3 = values[-3:] if len(values) >= 3 else values
+    feature_row: dict[str, float | int] = {
+        "time_index": time_index,
+        "month": int(forecast_date.month),
+        "quarter": int(((forecast_date.month - 1) // 3) + 1),
+        "month_sin": float(np.sin(2 * np.pi * forecast_date.month / 12)),
+        "month_cos": float(np.cos(2 * np.pi * forecast_date.month / 12)),
+        "lag_1": values[-1],
+        "lag_2": values[-2] if len(values) >= 2 else values[-1],
+        "lag_3": values[-3] if len(values) >= 3 else values[-1],
+        "rolling_mean_3": float(np.mean(recent_3)),
+        "rolling_std_3": float(np.std(recent_3, ddof=1)) if len(recent_3) > 1 else 0.0,
+        "pct_change_1": float((values[-1] - values[-2]) / values[-2]) if len(values) >= 2 and values[-2] != 0 else 0.0,
+        "pct_change_3": float((values[-1] - values[-4]) / values[-4]) if len(values) >= 4 and values[-4] != 0 else 0.0,
+    }
+    if "lag_6" in feature_columns:
+        feature_row["lag_6"] = values[-6] if len(values) >= 6 else values[-1]
+    if "lag_12" in feature_columns:
+        feature_row["lag_12"] = values[-12] if len(values) >= 12 else values[-1]
+    if "rolling_mean_6" in feature_columns:
+        feature_row["rolling_mean_6"] = float(np.mean(values[-6:])) if len(values) >= 6 else float(np.mean(values))
+
+    return pd.DataFrame([{column: feature_row.get(column, 0.0) for column in feature_columns}])
+
+
+def recursive_forecast_values(model: Any, history: list[float], future_dates: pd.DatetimeIndex, feature_columns: list[str]) -> list[float]:
     values = history.copy()
-    forecasts: list[dict[str, Any]] = []
-    next_index = len(values)
+    predictions: list[float] = []
 
-    for future_date in future_dates:
-        feature_row: dict[str, float | int] = {
-            "time_index": next_index,
-            "month": int(future_date.month),
-            "quarter": int(((future_date.month - 1) // 3) + 1),
-            "month_sin": float(np.sin(2 * np.pi * future_date.month / 12)),
-            "month_cos": float(np.cos(2 * np.pi * future_date.month / 12)),
-            "lag_1": values[-1],
-            "lag_2": values[-2] if len(values) >= 2 else values[-1],
-            "lag_3": values[-3] if len(values) >= 3 else values[-1],
-            "rolling_mean_3": float(np.mean(values[-3:])),
-            "rolling_std_3": float(np.std(values[-3:])),
-            "pct_change_1": float((values[-1] - values[-2]) / values[-2]) if len(values) >= 2 and values[-2] != 0 else 0.0,
-            "pct_change_3": float((values[-1] - values[-4]) / values[-4]) if len(values) >= 4 and values[-4] != 0 else 0.0,
-        }
-        if "lag_6" in feature_columns:
-            feature_row["lag_6"] = values[-6] if len(values) >= 6 else values[-1]
-        if "lag_12" in feature_columns:
-            feature_row["lag_12"] = values[-12] if len(values) >= 12 else values[-1]
-        if "rolling_mean_6" in feature_columns:
-            feature_row["rolling_mean_6"] = float(np.mean(values[-6:])) if len(values) >= 6 else float(np.mean(values))
-
-        feature_frame = pd.DataFrame([{column: feature_row.get(column, 0.0) for column in feature_columns}])
+    for offset, future_date in enumerate(future_dates):
+        feature_frame = build_recursive_feature_row(values, future_date, len(history) + offset, feature_columns)
         prediction = max(0.0, float(model.predict(feature_frame)[0]))
         values.append(prediction)
-        forecasts.append({"date": future_date.strftime("%Y-%m-%d"), "value": round(prediction, 2)})
-        next_index += 1
+        predictions.append(prediction)
 
-    return forecasts
+    return predictions
+
+
+def recursive_forecast(model: Any, history: list[float], future_dates: pd.DatetimeIndex, feature_columns: list[str]) -> list[dict[str, Any]]:
+    predictions = recursive_forecast_values(model, history, future_dates, feature_columns)
+    return [
+        {"date": future_date.strftime("%Y-%m-%d"), "value": round(prediction, 2)}
+        for future_date, prediction in zip(future_dates, predictions)
+    ]
 
 
 def run_baseline_model(monthly: pd.DataFrame) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -508,14 +573,21 @@ def build_confidence_summary(model_results: list[dict[str, Any]], best_model: di
     best_rmse = best_model.get("rmse")
     best_r2 = best_model.get("r2")
     baseline_rmse = baseline.get("rmse") if baseline else None
+    selected_is_baseline = best_model.get("model") == "Seasonal Baseline"
 
     beats_baseline = bool(
-        baseline_rmse is not None and best_rmse is not None and float(best_rmse) <= float(baseline_rmse) * 0.95
+        baseline_rmse is not None
+        and best_rmse is not None
+        and not selected_is_baseline
+        and float(best_rmse) <= float(baseline_rmse) * 0.95
     )
     sparse_series = bool(monthly_meta.get("missing_months_filled") or monthly_meta.get("partial_last_period_removed"))
     monthly_gaps = int(monthly_meta.get("missing_months_filled", 0))
 
-    if best_mape is not None and float(best_mape) <= 12 and beats_baseline and not sparse_series:
+    if selected_is_baseline:
+        label = "Baseline-led"
+        reason = "The seasonal baseline outperformed the trained ML models on the leakage-free holdout, so it is the most defensible forecast for this upload."
+    elif best_mape is not None and float(best_mape) <= 12 and beats_baseline and not sparse_series:
         label = "Strong"
         reason = "The selected model clearly beat the baseline on this upload and is suitable for confident directional forecasting."
     elif best_mape is not None and float(best_mape) <= 20 and beats_baseline:
@@ -532,6 +604,7 @@ def build_confidence_summary(model_results: list[dict[str, Any]], best_model: di
         "label": label,
         "reason": reason,
         "beats_baseline": beats_baseline,
+        "selected_is_baseline": selected_is_baseline,
         "baseline_model": baseline.get("model") if baseline else None,
         "baseline_rmse": baseline_rmse,
         "best_model_rmse": best_rmse,
@@ -617,33 +690,33 @@ def build_eda_summary(df: pd.DataFrame, schema: dict[str, Any], target_column: s
 
 
 def run_tree_models(monthly: pd.DataFrame) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
-    feature_frame = create_feature_frame(monthly)
+    if len(monthly) < 8:
+        raise HTTPException(status_code=400, detail="Not enough monthly history to train forecasting models reliably.")
+
+    holdout = min(FORECAST_MONTHS, max(1, len(monthly) // 4))
+    train_monthly = monthly.iloc[:-holdout].reset_index(drop=True)
+    test_monthly = monthly.iloc[-holdout:].reset_index(drop=True)
+    feature_frame = create_feature_frame(train_monthly)
     if len(feature_frame) < 4:
-        raise HTTPException(status_code=400, detail="Not enough time history to train forecasting models reliably.")
-
-    holdout = min(3, max(1, len(feature_frame) // 3))
-    if len(feature_frame) - holdout < 2:
-        raise HTTPException(status_code=400, detail="Not enough time history to split training and evaluation windows.")
-
-    train = feature_frame.iloc[:-holdout]
-    test = feature_frame.iloc[-holdout:]
+        raise HTTPException(status_code=400, detail="Not enough lagged history to train forecasting models reliably.")
 
     feature_columns = [column for column in feature_frame.columns if column not in {"date", "target"}]
-
-    x_train = train[feature_columns]
-    y_train = train["target"]
-    x_test = test[feature_columns]
-    y_test = test["target"].to_numpy()
+    x_train = feature_frame[feature_columns]
+    y_train = feature_frame["target"]
+    y_test = test_monthly["target"].to_numpy()
 
     future_dates = pd.date_range(monthly["date"].max() + pd.offsets.MonthBegin(1), periods=FORECAST_MONTHS, freq="MS")
-    history = monthly["target"].tolist()
+    evaluation_history = train_monthly["target"].astype(float).tolist()
+    final_feature_frame = create_feature_frame(monthly)
+    final_feature_columns = [column for column in final_feature_frame.columns if column not in {"date", "target"}]
+    final_history = monthly["target"].astype(float).tolist()
 
-    models: list[tuple[str, Any]] = [
+    models: list[tuple[str, Callable[[], Any]]] = [
         (
             "Random Forest",
-            RandomForestRegressor(
+            lambda: RandomForestRegressor(
                 n_estimators=500,
-                random_state=42,
+                random_state=RANDOM_SEED,
                 max_depth=10,
                 min_samples_leaf=1,
                 min_samples_split=2,
@@ -651,7 +724,7 @@ def run_tree_models(monthly: pd.DataFrame) -> tuple[list[dict[str, Any]], dict[s
         ),
         (
             "XGBoost",
-            XGBRegressor(
+            lambda: XGBRegressor(
                 n_estimators=500,
                 learning_rate=0.03,
                 max_depth=4,
@@ -659,7 +732,7 @@ def run_tree_models(monthly: pd.DataFrame) -> tuple[list[dict[str, Any]], dict[s
                 colsample_bytree=0.95,
                 reg_lambda=1.2,
                 objective="reg:squarederror",
-                random_state=42,
+                random_state=RANDOM_SEED,
             ),
         ),
     ]
@@ -667,11 +740,22 @@ def run_tree_models(monthly: pd.DataFrame) -> tuple[list[dict[str, Any]], dict[s
     model_results: list[dict[str, Any]] = []
     forecasts: dict[str, list[dict[str, Any]]] = {}
 
-    for name, model in models:
+    for name, model_factory in models:
+        model = model_factory()
         model.fit(x_train, y_train)
-        predictions = np.maximum(0.0, model.predict(x_test))
+        predictions = np.array(
+            recursive_forecast_values(
+                model,
+                evaluation_history,
+                pd.DatetimeIndex(test_monthly["date"]),
+                feature_columns,
+            )
+        )
         metrics = compute_metrics(y_test, predictions)
-        forecast = recursive_forecast(model, history, future_dates, feature_columns)
+
+        final_model = model_factory()
+        final_model.fit(final_feature_frame[final_feature_columns], final_feature_frame["target"])
+        forecast = recursive_forecast(final_model, final_history, future_dates, final_feature_columns)
         forecasts[name] = forecast
         model_results.append({"model": name, **metrics, "status": "trained"})
 
@@ -683,36 +767,8 @@ def run_tree_models(monthly: pd.DataFrame) -> tuple[list[dict[str, Any]], dict[s
     return model_results, forecasts
 
 
-def run_lstm_model(monthly: pd.DataFrame) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    values = monthly["target"].astype(float).to_numpy()
-    if len(values) < 10:
-        return (
-            {"model": "LSTM", "status": "skipped", "reason": "Not enough history for stable LSTM training."},
-            [],
-        )
-
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(values.reshape(-1, 1)).flatten()
-    window = 6 if len(values) >= 12 else 3
-
-    x_sequences: list[np.ndarray] = []
-    y_sequences: list[float] = []
-    for index in range(window, len(scaled)):
-        x_sequences.append(scaled[index - window : index])
-        y_sequences.append(scaled[index])
-
-    x = np.array(x_sequences).reshape(-1, window, 1)
-    y = np.array(y_sequences)
-
-    holdout = min(3, max(1, len(x) // 3))
-    if len(x) - holdout < 2:
-        return (
-            {"model": "LSTM", "status": "skipped", "reason": "Not enough history for stable LSTM training."},
-            [],
-        )
-    x_train, x_test = x[:-holdout], x[-holdout:]
-    y_train, y_test = y[:-holdout], y[-holdout:]
-
+def build_lstm_model(window: int) -> keras.Sequential:
+    keras.utils.set_random_seed(RANDOM_SEED)
     model = keras.Sequential(
         [
             keras.layers.Input(shape=(window, 1)),
@@ -722,31 +778,90 @@ def run_lstm_model(monthly: pd.DataFrame) -> tuple[dict[str, Any], list[dict[str
         ]
     )
     model.compile(optimizer="adam", loss="mse")
+    return model
 
+
+def build_lstm_sequences(scaled: np.ndarray, window: int) -> tuple[np.ndarray, np.ndarray]:
+    x_sequences: list[np.ndarray] = []
+    y_sequences: list[float] = []
+    for index in range(window, len(scaled)):
+        x_sequences.append(scaled[index - window : index])
+        y_sequences.append(scaled[index])
+
+    x = np.array(x_sequences).reshape(-1, window, 1)
+    y = np.array(y_sequences)
+    return x, y
+
+
+def train_lstm_model(x: np.ndarray, y: np.ndarray, window: int) -> keras.Sequential:
+    model = build_lstm_model(window)
     callbacks = [keras.callbacks.EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True)]
+    validation_split = 0.2 if len(x) >= 5 else 0.0
     model.fit(
-        x_train,
-        y_train,
-        validation_split=0.2,
+        x,
+        y,
+        validation_split=validation_split,
         epochs=80,
         batch_size=8,
         verbose=0,
-        callbacks=callbacks,
+        callbacks=callbacks if validation_split else None,
+        shuffle=False,
     )
+    return model
 
-    predicted_scaled = model.predict(x_test, verbose=0).flatten()
-    predicted = scaler.inverse_transform(predicted_scaled.reshape(-1, 1)).flatten()
-    actual = scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
-    metrics = compute_metrics(actual, predicted)
 
-    rolling_window = scaled[-window:].tolist()
-    future_dates = pd.date_range(monthly["date"].max() + pd.offsets.MonthBegin(1), periods=FORECAST_MONTHS, freq="MS")
-    forecast: list[dict[str, Any]] = []
-    for future_date in future_dates:
+def run_lstm_model(monthly: pd.DataFrame) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    values = monthly["target"].astype(float).to_numpy()
+    if len(values) < 10:
+        return (
+            {"model": "LSTM", "status": "skipped", "reason": "Not enough history for stable LSTM training."},
+            [],
+        )
+
+    holdout = min(FORECAST_MONTHS, max(1, len(values) // 4))
+    train_values = values[:-holdout]
+    test_values = values[-holdout:]
+    window = 6 if len(train_values) >= 12 else 3
+    if len(train_values) <= window + 2:
+        return (
+            {"model": "LSTM", "status": "skipped", "reason": "Not enough pre-holdout history for stable LSTM training."},
+            [],
+        )
+
+    evaluation_scaler = MinMaxScaler()
+    train_scaled = evaluation_scaler.fit_transform(train_values.reshape(-1, 1)).flatten()
+    x_train, y_train = build_lstm_sequences(train_scaled, window)
+    if len(x_train) < 3:
+        return (
+            {"model": "LSTM", "status": "skipped", "reason": "Not enough lagged sequences for stable LSTM training."},
+            [],
+        )
+
+    model = train_lstm_model(x_train, y_train, window)
+
+    rolling_window = train_scaled[-window:].tolist()
+    predicted: list[float] = []
+    for _ in test_values:
         input_array = np.array(rolling_window[-window:]).reshape(1, window, 1)
         next_scaled = float(model.predict(input_array, verbose=0).flatten()[0])
         rolling_window.append(next_scaled)
-        next_value = max(0.0, float(scaler.inverse_transform([[next_scaled]])[0][0]))
+        predicted.append(max(0.0, float(evaluation_scaler.inverse_transform([[next_scaled]])[0][0])))
+    metrics = compute_metrics(test_values, np.array(predicted))
+
+    final_scaler = MinMaxScaler()
+    final_scaled = final_scaler.fit_transform(values.reshape(-1, 1)).flatten()
+    final_window = 6 if len(values) >= 12 else 3
+    x_full, y_full = build_lstm_sequences(final_scaled, final_window)
+    final_model = train_lstm_model(x_full, y_full, final_window)
+
+    rolling_window = final_scaled[-final_window:].tolist()
+    future_dates = pd.date_range(monthly["date"].max() + pd.offsets.MonthBegin(1), periods=FORECAST_MONTHS, freq="MS")
+    forecast: list[dict[str, Any]] = []
+    for future_date in future_dates:
+        input_array = np.array(rolling_window[-final_window:]).reshape(1, final_window, 1)
+        next_scaled = float(final_model.predict(input_array, verbose=0).flatten()[0])
+        rolling_window.append(next_scaled)
+        next_value = max(0.0, float(final_scaler.inverse_transform([[next_scaled]])[0][0]))
         forecast.append({"date": future_date.strftime("%Y-%m-%d"), "value": round(next_value, 2)})
 
     return {"model": "LSTM", **metrics, "status": "trained"}, forecast
@@ -758,15 +873,18 @@ def choose_best_model(model_results: list[dict[str, Any]]) -> dict[str, Any]:
         for result in model_results
         if result.get("status") == "trained"
         and result.get("rmse") is not None
-        and result.get("model") != "Seasonal Baseline"
     ]
     if not trained:
-        return {"model": "Unavailable", "reason": "No ML or LSTM models were trained successfully."}
+        return {"model": "Unavailable", "reason": "No candidate models were trained successfully."}
 
     best = min(trained, key=lambda result: float(result["rmse"]))
+    if best.get("model") == "Seasonal Baseline":
+        reason = "It produced the lowest leakage-free holdout RMSE, so the simpler baseline is preferred over the ML models for this upload."
+    else:
+        reason = "It delivered the lowest leakage-free holdout RMSE among the trained candidates."
     return {
         **best,
-        "reason": "It delivered the lowest RMSE among the trained Random Forest, XGBoost, and LSTM models.",
+        "reason": reason,
     }
 
 
@@ -926,7 +1044,7 @@ def process_dataset(file_name: str, file_bytes: bytes, overrides: dict[str, str 
     confidence_summary = build_confidence_summary(model_results, best_model, monthly_meta)
     if best_model.get("model") != "Unavailable":
         best_model["reason"] = (
-            f"{best_model['model']} was selected because it achieved the lowest RMSE among the trained forecasting models. "
+            f"{best_model['model']} was selected because it achieved the lowest RMSE on the leakage-free holdout evaluation. "
             f"Forecast reliability for this upload is {confidence_summary['label']}."
         )
     eda_summary = build_eda_summary(cleaned_df, schema, target_column, monthly)
@@ -944,7 +1062,11 @@ def process_dataset(file_name: str, file_bytes: bytes, overrides: dict[str, str 
             "monthly_meta": monthly_meta,
             "confidence_summary": confidence_summary,
             "eda_summary": eda_summary,
-            "monthly_series": monthly.assign(date=monthly["date"].dt.strftime("%Y-%m-%d")).to_dict(orient="records"),
+            "monthly_series": (
+                monthly.assign(date=monthly["date"].dt.strftime("%Y-%m-%d"))
+                .rename(columns={"target": "value"})
+                .to_dict(orient="records")
+            ),
             "preview_rows": preview_rows(cleaned_df),
             "model_results": model_results,
             "best_model": best_model,
@@ -985,7 +1107,7 @@ def answer_chat_question(run: dict[str, Any], message: str) -> str:
     if "why" in question and "model" in question:
         confidence = run.get("confidence_summary", {})
         return (
-            f"{best_model.get('model', 'The selected model')} was chosen because it produced the lowest RMSE among Random Forest, XGBoost, and LSTM on this upload. "
+            f"{best_model.get('model', 'The selected model')} was chosen because it produced the lowest RMSE in the leakage-free holdout evaluation. "
             f"{best_model.get('reason', '')} "
             f"The current reliability label is {confidence.get('label', 'Developing')}: {confidence.get('reason', '')}"
         ).strip()

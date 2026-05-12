@@ -64,6 +64,15 @@ const formatMetric = (value?: number | null) => {
   return value.toFixed(2);
 };
 
+const getMonthlyValue = (point: { value?: number; target?: number }) => point.value ?? point.target ?? 0;
+
+const chartTooltipStyle = {
+  backgroundColor: "hsl(220, 18%, 10%)",
+  border: "1px solid hsl(220, 14%, 18%)",
+  borderRadius: "8px",
+  fontSize: 12,
+};
+
 const readAnalysisResult = (): AnalysisResult | null => {
   try {
     const raw = localStorage.getItem(ANALYSIS_STORAGE_KEY);
@@ -110,7 +119,7 @@ const Dashboard = () => {
 
   const trainedModels = useMemo(() => {
     return (analysis?.model_results ?? []).filter(
-      (result): result is ModelResult => result.status === "trained" && result.model !== "Seasonal Baseline",
+      (result): result is ModelResult => result.status === "trained",
     );
   }, [analysis]);
 
@@ -121,7 +130,7 @@ const Dashboard = () => {
 
     const history = analysis.monthly_series.map((point) => ({
       date: point.date.slice(0, 7),
-      historical: point.value,
+      historical: getMonthlyValue(point),
       forecast: undefined,
     }));
 
@@ -129,14 +138,13 @@ const Dashboard = () => {
       return history;
     }
 
-    const forecastStart = analysis.forecast_summary[0].date.slice(0, 7);
-    const bridgePoint = history.length
-      ? {
-          date: forecastStart,
-          historical: history[history.length - 1].historical,
-          forecast: analysis.forecast_summary[0].value,
-        }
-      : null;
+    if (history.length) {
+      const lastHistoryPoint = history[history.length - 1];
+      history[history.length - 1] = {
+        ...lastHistoryPoint,
+        forecast: lastHistoryPoint.historical,
+      };
+    }
 
     const forecast = analysis.forecast_summary.map((point) => ({
       date: point.date.slice(0, 7),
@@ -144,7 +152,7 @@ const Dashboard = () => {
       forecast: point.value,
     }));
 
-    return bridgePoint ? [...history, bridgePoint, ...forecast] : [...history, ...forecast];
+    return [...history, ...forecast];
   }, [analysis]);
 
   const seasonalData = useMemo(() => analysis?.eda_summary.seasonal_pattern ?? [], [analysis]);
@@ -172,7 +180,8 @@ const Dashboard = () => {
       { label: "Rows after cleaning", value: summary.rows_after_cleaning.toLocaleString() },
       { label: "Duplicates removed", value: summary.duplicates_removed.toLocaleString() },
       { label: "Invalid dates removed", value: summary.invalid_dates_removed.toLocaleString() },
-      { label: "Missing months assumed zero", value: analysis.monthly_meta.missing_months_filled.toLocaleString() },
+      { label: "Invalid target rows removed", value: (summary.target_values_removed ?? 0).toLocaleString() },
+      { label: "Monthly gaps handled", value: `${analysis.monthly_meta.missing_months_filled.toLocaleString()} (${analysis.monthly_meta.missing_months_method ?? "not needed"})` },
       { label: "Trimmed text columns", value: summary.trimmed_text_columns.length ? summary.trimmed_text_columns.join(", ") : "None" },
     ];
   }, [analysis]);
@@ -270,12 +279,8 @@ const Dashboard = () => {
                 <XAxis dataKey="date" stroke="hsl(215, 12%, 50%)" fontSize={11} />
                 <YAxis stroke="hsl(215, 12%, 50%)" fontSize={11} />
                 <Tooltip
-                  contentStyle={{
-                    backgroundColor: "hsl(220, 18%, 10%)",
-                    border: "1px solid hsl(220, 14%, 18%)",
-                    borderRadius: "8px",
-                    fontSize: 12,
-                  }}
+                  cursor={false}
+                  contentStyle={chartTooltipStyle}
                 />
                 {forecastStartLabel ? (
                   <ReferenceLine x={forecastStartLabel} stroke="hsl(40, 90%, 55%)" strokeDasharray="6 6" />
@@ -361,14 +366,16 @@ const Dashboard = () => {
                   <XAxis type="number" stroke="hsl(215, 12%, 50%)" fontSize={11} />
                   <YAxis dataKey="name" type="category" stroke="hsl(215, 12%, 50%)" fontSize={11} width={100} />
                   <Tooltip
-                    contentStyle={{
-                      backgroundColor: "hsl(220, 18%, 10%)",
-                      border: "1px solid hsl(220, 14%, 18%)",
-                      borderRadius: "8px",
-                      fontSize: 12,
-                    }}
+                    cursor={false}
+                    contentStyle={chartTooltipStyle}
                   />
-                  <Bar dataKey="value" name="Sales" fill="hsl(160, 84%, 39%)" radius={[0, 4, 4, 0]} />
+                  <Bar
+                    dataKey="value"
+                    name="Sales"
+                    fill="hsl(160, 84%, 39%)"
+                    radius={[0, 4, 4, 0]}
+                    activeBar={{ fill: "hsl(160, 84%, 52%)", stroke: "hsl(160, 84%, 64%)", strokeWidth: 1 }}
+                  />
                 </BarChart>
               </ResponsiveContainer>
             ) : (
@@ -386,14 +393,16 @@ const Dashboard = () => {
                 <XAxis dataKey="month_name" stroke="hsl(215, 12%, 50%)" fontSize={11} />
                 <YAxis stroke="hsl(215, 12%, 50%)" fontSize={11} />
                 <Tooltip
-                  contentStyle={{
-                    backgroundColor: "hsl(220, 18%, 10%)",
-                    border: "1px solid hsl(220, 14%, 18%)",
-                    borderRadius: "8px",
-                    fontSize: 12,
-                  }}
+                  cursor={false}
+                  contentStyle={chartTooltipStyle}
                 />
-                <Bar dataKey="target" name="Average monthly sales" fill="hsl(200, 80%, 50%)" radius={[4, 4, 0, 0]} />
+                <Bar
+                  dataKey="target"
+                  name="Average monthly sales"
+                  fill="hsl(200, 80%, 50%)"
+                  radius={[4, 4, 0, 0]}
+                  activeBar={{ fill: "hsl(200, 90%, 62%)", stroke: "hsl(200, 90%, 72%)", strokeWidth: 1 }}
+                />
               </BarChart>
             </ResponsiveContainer>
           </motion.div>
@@ -426,7 +435,7 @@ const Dashboard = () => {
             </div>
             <div className="mt-4 space-y-3">
               <div className="rounded-lg bg-muted/40 p-4 text-xs text-muted-foreground">
-                Lower MAE, RMSE, and MAPE values are better. Higher R2 is better. The seasonal baseline is only a reference check and is never selected as the final project model.
+                Lower MAE, RMSE, and MAPE values are better. Higher R2 is better. The selected model is the candidate with the strongest leakage-free holdout RMSE, including the seasonal baseline when it wins.
               </div>
               <div className="rounded-lg bg-primary/5 p-4 text-sm text-foreground">
                 <span className="font-semibold">Why {bestModelName} was selected:</span> {analysis.best_model.reason ?? "It gave the most stable result among the trained models for this upload."}

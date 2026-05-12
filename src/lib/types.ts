@@ -18,6 +18,7 @@ export interface CleaningSummary {
   rows_after_cleaning: number;
   duplicates_removed: number;
   invalid_dates_removed: number;
+  target_values_removed?: number;
   trimmed_text_columns: string[];
   missing_values_before: Record<string, number>;
   missing_values_after: Record<string, number>;
@@ -44,9 +45,13 @@ export interface OverviewInfo {
 
 export interface MonthlyMeta {
   missing_months_filled: number;
+  missing_months_method?: string;
   partial_last_period_removed: boolean;
+  partial_last_period?: string | null;
   series_length: number;
   observed_months?: number;
+  latest_period_days_observed?: number | null;
+  typical_period_days_observed?: number | null;
   gap_handling?: string;
 }
 
@@ -54,6 +59,7 @@ export interface ConfidenceSummary {
   label: string;
   reason: string;
   beats_baseline: boolean;
+  selected_is_baseline?: boolean;
   baseline_model: string | null;
   baseline_rmse: number | null;
   best_model_rmse: number | null;
@@ -107,6 +113,12 @@ export interface ForecastPoint {
   value: number;
 }
 
+export interface MonthlySeriesPoint {
+  date: string;
+  value?: number;
+  target?: number;
+}
+
 export interface Recommendation {
   item: string;
   group: string;
@@ -131,7 +143,7 @@ export interface AnalysisResult {
   monthly_meta: MonthlyMeta;
   confidence_summary: ConfidenceSummary;
   eda_summary: EdaSummary;
-  monthly_series: ForecastPoint[];
+  monthly_series: MonthlySeriesPoint[];
   preview_rows: Record<string, string | number | null>[];
   model_results: ModelResult[];
   best_model: {
